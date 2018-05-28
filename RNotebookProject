@@ -1,0 +1,805 @@
+---
+title: "Staying Relevant: Machine learning to predict how long a YouTube video will trend for."
+output: html_notebook
+---
+
+
+#Contribution list
+
+The project was collaborative, with each of our small team of 3 helping eachother. However, we were given the following subsections to be in charge of. Key tasks performed outside of those subsections are included as bullet points.
+
+Feng Xiao (FX271) - Exploratory visualisations including heatmaps and corrplots
+
+ * Supported others with ggplot use
+  
+Sam Thomas (ST616) - Data mining and associated visualisations
+
+ * k-means elbow method for loop and plot
+ * Google API and obtaining channel data
+ * Figure 7 user interaction distributions
+  
+Junwei Xing (JX499) - Machine learning and associated visualisations 
+
+ * Produced k-means, regression tree and compared these outputs with other methods like neural networks.
+
+#Introduction
+Data, detailing the top 200 trending YouTube videos each day for 5 major countries, is available from [Kaggle](https://www.kaggle.com/datasnaek/youtube-new/). Here we use this data to create a regression tree that predicts how many days a YouTube video will trend for. We predict this based on YouTube channel data; text mining of the descriptions, titles and tags the videos have; on time-sensitive data such as whether the video is posted on the weekend on a weekday, and based on the type of video. The model is targetted at a YouTube centred business to help them create good, lasting content.
+
+This approach is chosen based on our exploratory/prescriptive analysis which set out to understand the following questions:
+
+  * How is the data distributed across categories and countries?
+  * What is the covariance between measures of user interactions with the videos - e.g. likes, views and comments/
+  * How do time variables describe success?
+
+The findings of this analysis direct and provide data for a prescriptive machine learning with the aim of:
+
+  * Predicting how many days a YouTube video will trend for?
+
+This report, therefore progresses through sections of *Data Preparation*, *Exploratory Analysis*, *Prescriptive Analysis*, *Predictive Analysis* and *Conclusion*.
+
+#Data preparation
+We begin by loading the data and appropriate R libraries.
+```{r warning=FALSE}
+#data manipulation
+library(data.table)
+library(dplyr)
+library(DT)
+library(lubridate)
+library(timeDate)
+library(rjson)
+library(tm)
+library(nnet)
+library(tidytext)
+library(tuber)
+library(devtools)
+#visualisation
+library(ggthemes)
+library(tidyverse)
+library(ggplot2)
+library(reshape2)
+library(scales)
+library(wordcloud)
+library(corrplot)
+#Machine learning
+library(rpart)
+library(rpart.plot)
+library(neuralnet)
+library(randomForest)
+library(rJava)
+library(RWeka)
+library(C50)
+library(gmodels)
+library(stringr)
+
+```
+The data is then loaded from downloaded [kaggle](https://www.kaggle.com/datasnaek/youtube-new/) CSV and JSON files.
+```{r warning=FALSE}
+##To run the code, ensure you set the working directory accordingly downloading data from relevant links
+#setwd("//myfiles/st616/dos/Data mining")
+
+#List of countries we have data for
+countryList <- list("GB","FR","CA","US","DE")
+#Initialize videos
+videos = 0
+for (country in 1:length(countryList)){
+  
+  #Read data. Taken from  https://www.kaggle.com/datasnaek/youtube-new/ on 18/05/18
+  #Saved as GBvideos.csv, FRvideos.csv...
+  data <-read.csv(paste(countryList[[country]],"videos.csv", sep="", quote = ""))
+  
+  #Set country name as column
+  data[,"Country"] = countryList[[country]]
+  
+  #Read JSON files from https://www.kaggle.com/datasnaek/youtube-new/ 
+  datacategory = fromJSON(file = paste(countryList[[country]],'_category_id.json', sep=""),  unexpected.escape = "error")
+  
+  #add categories using datacategory function
+  for (datalist in 1:nrow(data)) {
+    for (item in 1:length(datacategory$items)) {
+      if (data[datalist,"category_id"]==datacategory$items[[item]]$id){
+        data[datalist,"category"]=datacategory$items[[item]]$snippet$title
+      }
+    }
+  }
+  #On each run add new videos data to existing list
+  videos <- as.data.table(rbind(videos,data))
+}
+
+#functions to add data regarding dates, uses lubridate package.
+videos$trending_date <- ydm(videos$trending_date)
+videos$publish_time <- ymd(substr(videos$publish_time,start = 1,stop = 10))
+videos$trending_after <- videos$trending_date-videos$publish_time
+
+```
+The same video appears in the original data multiple times. As such, the data is here summarized by video, creating a new data set that will be referred to as the video summarized dataset. Importantly, video like, comment and dislike counts become the highest value they reach for each video and a count variable is created to detail how many days a video trends for.
+```{r warning=FALSE}
+#Order by trending date as later will allow removal of all but earliest instance
+new <- arrange(videos, desc(trending_date))
+
+#summarise by video id to remove replicates. Take count of how many days trending for as well as a number of other summary stats
+# e.g. max likes, max comments
+newdata <- new%>%
+  group_by(video_id) %>%
+  summarise(count = n_distinct(trending_date), mnTrendDate = min(trending_date), publish_date = max(publish_time), mxlikes = max(likes), 
+            mxviews = max(views), mxdislikes = max(dislikes), mxcomments = max(comment_count),
+            mintrend_after = min(trending_after), maxtrend_after = max(trending_after)) 
+
+# classify time between publish date and first trending date
+newdata$mintrend_after<-as.numeric(newdata$mintrend_after)
+newdata$trend_after_period <- cut(newdata$mintrend_after, breaks = c(0, 7, 30, 180,Inf),
+                                  labels = c('week', 'month', 'half year','> half year'), right = FALSE)
+
+#add back constant variables such as descriptions that weren't summarised previously
+newdata <- left_join(newdata,new[,c(1,3:5,7,12:18)], by= "video_id", copy =FALSE)
+
+#remove dupicates to only take first instance - will take country it first trends in as country, all else managed by summarising
+# e.g. difference in likes per instance
+newdata <- newdata[!duplicated(newdata$video_id),]
+
+#1 entry has zero value, this is removed as immaterial
+newdata <- newdata[newdata$category_id != 0,]
+
+#One category does not have a name (category ID 29). We have labelled it other as it is small.
+newdata$category[is.na(newdata$category)] <- "Other"
+
+# create new variables regarding publish date
+newdata$publish_date_weekend<-isWeekend(as.Date(newdata$publish_date))
+newdata$publish_date_wday <- wday(as.Date(newdata$publish_date))
+newdata$publish_date_month <- month(as.Date(newdata$publish_date))  # we have data from 2017-11-11 to 2018-05-17
+```
+The data can then be summarized, for instance, to show the total number of videos present for each category of video, as shown in figure 1.
+```{r warning=FALSE}
+# video numbers of different categories
+newdata %>%
+  filter (Country != '0'& category!="NA") %>%
+  group_by(category)%>%
+  summarise(count=n_distinct(video_id)) %>%
+  ggplot(aes(reorder(category,count),count,fill=category))+
+  geom_bar(stat="identity")+
+  guides(fill="none")+
+  geom_label(aes(label=count))+
+  xlab("Categories")+
+  ylab("Total Number of Videos")+
+  theme(panel.grid =element_blank())+coord_flip()
+```
+**Figure 1:** Number of videos by category.
+
+A youtube API was used to extract the number of channel subscribers and the age of the channel for each video. The API code is included here, however it is **not recommended that you run this** as it takes a number of hours to complete. 
+```{r warning=FALSE}
+#devtools::install_github("soodoku/tuber", build_vignettes = TRUE)
+
+#yt_oauth("524186543206-gtogl0tkgsnsrf590a4h4b8a090d2483.apps.googleusercontent.com", "-EJAVcj0_FE2iPfeBGTJZNMs")
+
+#loop over instances loading video details. Would be considerably quicker to use lapply function - this is recommended if work replicated. However,
+#this method allowed number to be printed and therefore process to be tracked. Deemed more appropriate for our needs.
+#newdata["channel_id"] = 0
+#for (i in 1:length(newdata$video_id)){
+ # t<- try(newdata$channel_id[i] <- get_video_details(as.character(newdata$video_id[i]))$items[[1]]$snippet$channelId)
+  #if(is(t, "try-error")){next}
+   #print (i)
+#}
+
+#seperately loop over to get channel data. Any channels that don't exist are ignored and left as 0 value which we initiate first.
+#newdata["channel_subs"] = 0
+#newdata["channel_age"] = 0
+#for (i in 1:length(newdata$video_id)){
+ # t <- try(newdata$channel_subs[i] <- get_channel_stats(as.character(newdata$channel_id[i]))$statistics$subscriberCount)
+  #if(is(t, "try-error")){next}
+  #t2 <- try(newdata$channel_age[i] <- get_channel_stats(as.character(newdata$channel_id[i]))$snippet$publishedAt)
+  #if(is(t2, "try-error")){next}
+  #}
+
+#Save to csv - see load below. extracts video id and final 3 loaded columns from above.
+#write.csv(newdata[,c(1,length(newdata)-2:length(newdata))],"video_to_channel_details.csv")
+```
+Instead, a csv of the results is included and is joined to the original data. The API was successful, obtaining roughly 5/7ths of the subscriber count of the relevant channels. Those without subscriber data were estimated to have the median subscribers of the category type they fall in. This was done as category was shown to be the best indicator of subscriber level (not shown).
+```{r warning=FALSE}
+#load data from above
+channel_data <- read.csv("video_to_channel_details.csv")[,2:5]
+newdata <- left_join(newdata,channel_data, by = "video_id")
+
+#gives 20300/70000 channels that dont have subscriber numbers the median subscribers for the relevant category as the best estimator
+#of subscribers
+
+#Assign empty values median value of the category they fall into. Median taken due to non-linear subscriber count distribution (exponential).
+for (i in 1:length(unique(newdata$category_id))){
+  catSub <- newdata[newdata$category_id == 1,]
+  newdata$channel_subs[is.na(newdata$channel_id)] <- median(catSub$channel_subs[!is.na(catSub$channel_subs)])
+  newdata$channel_subs[is.na(newdata$channel_id)] <- median(catSub$channel_subs[!is.na(catSub$channel_age)])
+}
+```
+#Exploratory Analysis
+
+Plotted in the same order of categories as figure 1, it is interesting and notable that average views vary independently of the number of videos. Notably, music videos get significantly more views than any other, and News makes up a significant portion of the total number of videos but has a small share of the views.
+```{r warning=FALSE}
+#average views between categories
+newdata %>%
+  filter(Country != "0"& category!="NA") %>%
+  group_by(category) %>%
+  summarise(average= mean(mxviews), count = n_distinct(video_id)) %>%
+  ggplot(aes(reorder(category,count),y=average, fill=category))  + 
+  geom_bar(stat = "identity") +
+  guides(fill="none")+
+  geom_label(aes(label=paste(as.character(round(average/1000,0)),"k")))+
+  xlab("Categories")+
+  ylab("Average Views")+
+  theme(panel.grid =element_blank())+
+  coord_flip()
+
+
+```
+**Figure 2:** Average view is significantly influenced by type. Video summarized dataset. 
+```{r}
+
+newdata %>%
+  filter(Country != "0"& category!="NA") %>%
+  group_by(category) %>%
+  summarise(average= mean(mxviews), countvids = n_distinct(video_id),trending_days = mean(count) ) %>%
+  ggplot(aes(reorder(category,countvids),y=trending_days, fill=category))  + 
+  geom_bar(stat = "identity") +
+  guides(fill="none")+
+  geom_label(aes(label=round(trending_days,1)))+
+  xlab("Categories")+
+  ylab("Average Trending days")+
+  theme(panel.grid =element_blank())+
+  coord_flip()
+```
+**Figure 3:** Average days is trending significantly influenced by type. Video summarized dataset.
+
+There is also variation between countries, with more music videos being posted in the UK and US, proportionally, than the 3 other countries.
+```{r warning=FALSE}
+videos %>%
+  filter (Country != '0'& category!="NA" &
+            category %in% c("Entertainment","Music","News & Politics",
+                            "Comedy","Sports","People & Blogs")) %>%
+  group_by(Country,category)%>%
+  summarise(number=n_distinct(video_id))%>%
+  ggplot(aes(category,number,fill=category))+
+  geom_bar(stat="identity")+
+  guides(fill="none")+
+  facet_grid(~ Country, scales = "free")+
+  labs(title="Watching preference between countries")+
+  ylab("Video numbers ")+xlab("categories")+
+  theme(panel.grid =element_blank())+coord_flip()
+```
+**Figure 4:** Major video categories show variation in frequency between countries - GB and US have many music videos. Full dataset.
+
+To meet answer our 2nd question of viewer interactions, a heat map of interactions by type is plotted. Interestingly days trending shows the most tangible variation; allowing differentiation by type. Non profits and activism have signficant levels of comments and likes, but this does not appear to translate into views.
+```{r warning=FALSE}
+#Heatmap
+heatdata<-newdata%>%
+  filter(category!="0")%>%
+  group_by(category)%>%
+ summarise(Likes=mean(mxlikes),views=mean(mxviews),Dislikes=mean(mxdislikes),Comments=mean(mxcomments),Trending_days=mean(count))
+heatdata<-arrange(heatdata,Likes)
+row.names(heatdata)<-heatdata$category
+data_matrix<-data.matrix(heatdata)
+data<-data_matrix[,2:6]
+data_heatmap <- heatmap(data, Rowv=NA, Colv=NA,  col=brewer.pal(9,"OrRd"), scale="column", 
+                        margins=c(10,11),main="Viewer Interaction Heatmap")
+
+```
+**Figure 5:** Heat map of viewer interaction data.
+
+Having reviewed the data, it is clear a number of candidates to indicate "success" of video are present. Plotting the correlations netweem these shows significant covariance between the values (Figure 6). As such we decide to take one and not a combination of values as a target output.
+```{r warning=FALSE}
+corrdata <- newdata%>%
+  group_by(video_id) %>%
+  summarise(days_trending= mean(count), likes = mean(mxlikes), 
+            views = mean(mxviews), dislikes = mean(mxdislikes), comments = max(mxcomments))
+
+
+# correlation between trending days with likes/dislikes/commtents/views
+corrplot.mixed(corr = cor(corrdata[,c("days_trending","likes","dislikes","comments","views")]),
+               upper = "shade", lower = "number",tl.col="black",
+               tl.offset=2,main="Correlation matrix",tl.cex = 0.6, mar = c(0,0,1,0))
+```
+**Figure 6:** Correlation plot of the 5 kinds of user interaction/output variables. These will not be fed into the machine learning as features as they are not controlable variables; they are measures of success, not predictors of success.
+
+Figure 7 looks at the distribution of the interaction values. It shows that number of days trending to be distributed in a more linear manner.
+```{r warning=FALSE}
+melted <- melt(newdata[,c(2,5:8)])
+levels(melted$variable) <- c("Days Trending", "Likes", "Views","Dislikes", "Comments")
+
+melted %>%
+  ggplot() +
+  geom_point(aes(x=value, y ="I"), position = "jitter", size = 0.3) +
+  scale_y_discrete(labels= "") +
+  coord_flip() +
+  facet_wrap(~variable,ncol=5, scales = "free")
+```
+**Figure 7:** Distribution of values for the 5 user interaction variables. Jitter function is used to spread point location for visibility.
+
+This agrees with our understanding of the problem in that views will be exponentially distributed with the prevalence of infrequent, viral videos. However, with all of these videos being popular (they're all top 200 videos), a true, predictable and explainable measure of success is days trending. Viral videos are likely to be one offs, but with the aim of informing businesses on attracting interest to their channels, multiple days trending (being consistently present on the YouTube home screen) is a better focus for our model.
+
+Moving onto our 3rd question of time dependency, figure 8 shows a negative relationship between the data at which a video trends and the count of trending videos. A large proportion videos trend immediately if they will trend, however there are a significant number which trend later. This and whether a video is posted on a weekday or weekend will be carried forward for analysis.
+```{r warning=FALSE}
+#Histogram
+top6 <- c("Entertainment","People & Blogs","News & Politics","Music","Sports","Comedy")
+top6_categories<- newdata[newdata$category %in% top6,]
+top6_categories%>%
+  ggplot()+
+  geom_histogram(aes(x=trend_after_period),stat = "count",fill="lightblue",binwidth = 1.0)+
+  scale_y_log10()+scale_x_discrete()+
+  facet_wrap(~category,ncol = 6)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+xlab("")+ylab("")+labs(title="Distribution of time taken to be trending") 
+
+```
+**Figure 8:** When do videos trend - a decreasing trend in time. This appears to happen irrelevant of video type.
+
+##Text mining
+With likes, dislikes, comments and number of days trending being classed as outcome variables, to support a predictive model, text mining of the tags, titles and video descriptions has been performed to evaluate if any of these impact video success. Numerical values for the text characteristics are calculated and included in the video summarized dataset, for use in predictive models, as follows.
+
+###Tags - quality or quantity?
+Each video is given a tags score as the sum of the popularity of each of the tags used; popularity being the frequency of their use globally (within the whole population). Each video also gets a "major tag" score, being how many times they use a tag in the top 500 tags, figure 9 shows the top 20 tags. Finally the number of tags is also added to the dataset.
+```{r warning=FALSE}
+#first remove spaces between words in tags. This makes tags one words. This is consistent with how youtube manages tags.
+#e.g. "Real Madrid" would be changed to RealMadrid; this allows us to count instances of the tag Real Madrid instead of the words
+#Real and Madrid. On youtube if you click on a tag it will handle entire tags as fixed entities. We will do the same.
+trydf <- newdata$tags
+trydf <- gsub(" ", "", trydf, fixed = TRUE)
+#tags are seperated by |, so we replace | with a space " " to seperate tags in each video
+trydf <- gsub("|", " ", trydf, fixed = TRUE)
+
+#create corpus from tags
+myCorpus <- Corpus(VectorSource(trydf))
+myCorpus <- tm_map(myCorpus, content_transformer(tolower))
+
+#build in functions to manage words
+removeURL <- function(x) gsub("http[^[:space:]]*", "", x)
+removeNumPunct <- function(x) gsub("[^[:alpha:][:space:]]*", "", x) 
+removeURL <- function(x) gsub("http[^[:space:]]*", "", x)
+removeNumPunct <- function(x) gsub("[^[:alpha:][:space:]]*", "", x) 
+toSpace <- content_transformer(function(x, pattern) {return (gsub(pattern," ",x))})
+
+#use functions to convert all tags to lower case, remove URLs and numbers/punctuation
+myCorpus <- tm_map(myCorpus, content_transformer(tolower))
+myCorpus <- tm_map(myCorpus, content_transformer(removeURL))
+myCorpus <- tm_map(myCorpus, content_transformer(removeNumPunct))
+
+#convert to term document matrix. Here Terms will be entire tags and documents will be videos. So matrix holds tags against videos
+tdm <- TermDocumentMatrix(myCorpus,control = list(wordLengths = c(1, Inf)))
+
+#make sure tag only appears once per tweet - some are repeated many times per tweet. We deem this not impactful although it may be
+tdm$v[tdm$v >= 1] <- 1 
+
+#create data frame with columns document number, term number, and value. Could also use tidy function
+tagsDF <- tidy(tdm)
+sumtags <- tagsDF %>%
+  group_by(term)%>%
+  summarise(tagcount = sum(count)) %>%
+  left_join(tagsDF,., by = c("term"))
+
+#returns 1 if video uses one of top 500 tags out of 290610
+sumtags["majortagcount"] = 0
+sumtags[sumtags[,4] > 200,]$majortagcount <- 1
+
+#sets document name as number
+sumtags$document <- as.numeric(sumtags$document)
+
+vidtagscore <- sumtags %>%
+  group_by(document) %>%
+  summarise(tagscore = sum(tagcount), tagnum = n_distinct(term), majortags = sum(majortagcount))
+
+#set column to merge on as ID lost in processing but order maintained. and joins on numb
+newdata["Numb"] = 1:length(newdata$video_id)
+
+newdata <- left_join(newdata,vidtagscore, by=c("Numb"="document"))
+
+#plots to understand common tweets TBC
+freq_thre = 1000
+freq.terms <- findFreqTerms(tdm, lowfreq = freq_thre)
+length(freq.terms)
+
+#cut so only frequent terms
+cut <- tdm[tdm$dimnames$Terms%in% freq.terms,]
+
+#create table of term frequency for cut
+term.freq <- rowSums(as.matrix(cut)) 
+
+# select the words(terms) appeared more then freq_thre times, according to selected term.freq
+topTagsDF <- data.frame(term = names(term.freq), freq = term.freq)
+
+#plot top
+topTagsDF %>%
+  filter(term != "none")%>%
+  ggplot(., aes(reorder(term,freq), y=freq, fill =term)) + geom_bar(stat="identity") +
+  guides(fill="none") +
+  xlab("Terms") + ylab("Count") + coord_flip() +
+  geom_label(aes(label=freq))+
+  theme(panel.grid =element_blank(),axis.text=element_text(size=7))
+
+
+```
+**Figure 9:** Top tags with count of use.
+
+###Titles - setting the mood for the video
+Reviewing the data saw significant and varied use of capital letters. To review whether all capitals GRABBED ATTENTION, or if no capitals limited success due to being untidy, the ratio of capitals:lower case letters is calculated, as well as the length of the title.
+```{r warning=FALSE}
+#simple detail length of title and upper:lower capitalisation ratio
+#count upper letters in title, split in half as operation too big otherwise
+newdata["upper"] <- 0
+newdata$upper[1:length(newdata$video_id)] <- lapply(regmatches(newdata$title[1:length(newdata$video_id)], gregexpr("[A-Z]", newdata$title[1:length(newdata$video_id)], perl=TRUE)), length)
+newdata["lower"] <- 0
+newdata$lower[1:length(newdata$video_id)] <- lapply(regmatches(newdata$title[1:length(newdata$video_id)], gregexpr("[a-z]", newdata$title[1:length(newdata$video_id)], perl=TRUE)), length)
+
+#length of title
+newdata["lentitle"] <- as.numeric(newdata$lower) + as.numeric(newdata$upper)
+newdata["propcapstitle"] <- as.numeric(newdata$upper)/newdata$lentitle
+newdata$propcapstitle[is.na(newdata$propcapstitle)] <- 0
+newdata<-newdata[ , !(names(newdata) %in% c("upper","lower"))]
+```
+Bona-fide text mining is then performed to identify popular words for titles.
+```{r warning=FALSE}
+#create title corpus
+titleCorpus <- tm_map(Corpus(VectorSource(newdata$title)),toSpace,"[^[:graph:]]")
+
+# convert to consistent terms
+titleCorpus <- tm_map(titleCorpus, content_transformer(tolower))
+titleCorpus <- tm_map(titleCorpus, content_transformer(removeURL))
+titleCorpus <- tm_map(titleCorpus, content_transformer(removeNumPunct))
+titleCorpus <- tm_map(titleCorpus, stripWhitespace)
+#remove french, german and english stop words as well as list of own stopwords removed
+titleCorpus <- tm_map(titleCorpus, removeWords, c(stopwords("english"),stopwords("french"),stopwords("german")))
+titleCorpus <- tm_map(titleCorpus, removeWords, c('ep','th','ii','ve','cÃ','st','na','fc','dr','mÃ','pÃ','sÃ','re','dÃ','wÃ','hÃ','rÃ','ka','lÃ','tÃ','si','aÃ','bÃ','gÃ','nÃ','ya','ge','fÃ','vÃ','eÃ','te','kÃ','va','me','jÃ','ba','ne','ng','ln','can','noÃ','spÃ','vie','grÃ','trÃ','prÃ','thÃ','tre','res','rie','frÃ','adÃ','sen','mal','maÃ','rtl','sat','tek','ber','afd','asmr','vidÃ','sumÃ','aprÃ','parÃ','franÃ',"øøø","øøøø","øøøøø","øøù","øøøøù", "ððð", "ðððð","ððððð","ððñ","ðððñ"))
+
+#convert to tdm
+titletdm <- TermDocumentMatrix(titleCorpus,control = list(wordLengths = c(3, Inf)))
+
+freq_high = 100
+freq.terms <- findFreqTerms(titletdm, lowfreq = freq_high)
+cuttitletdm <- titletdm[titletdm$dimnames$Terms %in% freq.terms,]
+
+# calculate the word frenquency 
+term.freq <- rowSums(as.matrix(cuttitletdm)) 
+# only keep the frequencies of words(terms) appeared more then freq_thre times
+term.freq <- subset(term.freq, term.freq >= freq_high) 
+# select the words(terms) appeared more then freq_thre times, according to selected term.freq
+freqtitlewords <- data.frame(term = names(term.freq), freq = term.freq)
+
+freqtitlewords <- freqtitlewords[order(freqtitlewords$freq),]
+freqtitlewords$term <- factor(freqtitlewords$term, levels = freqtitlewords$term[order(freqtitlewords$freq)])
+
+freqtitlewords %>%
+  arrange(desc(freq)) %>%
+  head(20) %>%
+  ggplot(., aes(x=term, y=freq, fill=term)) + geom_bar(stat="identity") +
+  guides(fill="none") +
+  xlab("Terms") + ylab("Count") + coord_flip() +
+  geom_label(aes(label=freq))+
+  theme(panel.grid =element_blank(),axis.text=element_text(size=7))
+```
+**Figure 10:** Most common words in titles with count.
+
+From the above, it is notable that the terms episodes, news, music and game are used very frequently, and that many of the other words are similar (e.g. show is like episode). Based on this information terms in the full data set are categorised by likeness to these terms. These terms run parellal to the categories, but it may be possible that title fitting in with the category is more important than the categorisation. A wordcloud in figure 11 then plots major words coloured relative to their likeness category.
+```{r warning=FALSE}
+#Find associated words from key groups spotted in previous plot
+cor_limit <- 0.01
+
+#game like gives value to words like playoffs, NFL, NBA, celtics, cavaliers (and many other sports team names), highlights
+gameLike <- findAssocs(titletdm, c('game','sport') ,cor_limit)
+#news gives words like trump, day, live
+newsLike <- findAssocs(titletdm, 'news' ,cor_limit)
+#music gives live, feat
+musicLike <- findAssocs(titletdm, 'music' ,cor_limit)
+# gives show
+episodeLike <- findAssocs(titletdm, 'episode' ,cor_limit)
+
+#create wordcloud
+titledtm <- as.DocumentTermMatrix(titletdm)
+
+#analysis of positive and negative words in full title
+DFfull <-tidy(titletdm)
+DFfull %>%
+  inner_join(get_sentiments("bing"), by= c("term"="word")) %>%
+  count(term, sentiment, sort = TRUE) %>%
+  acast(term ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray20", "gray80"),
+                   max.words = 120)
+
+#convert to DF
+DF <- tidy(cuttitletdm)
+
+#summarise term:count (remove document variable)
+DF <- DF %>%
+  group_by(term) %>%
+  summarise(count = sum(count))# %>%
+
+#join likeness scores
+DF <- left_join(DF,rownames_to_column(data.frame(game = as.matrix(gameLike$game))), by=c("term" = "rowname"))
+DF <- left_join(DF,rownames_to_column(data.frame(news = as.matrix(newsLike$news))), by=c("term" = "rowname"))
+DF <- left_join(DF,rownames_to_column(data.frame(music = as.matrix(musicLike$music))), by=c("term" = "rowname"))
+DF <- left_join(DF,rownames_to_column(data.frame(episode = as.matrix(episodeLike$episode))), by=c("term" = "rowname"))
+#set 0 if no likeness
+DF$game[is.na(DF$game)] <-0
+DF$news[is.na(DF$news)] <-0
+DF$music[is.na(DF$music)] <-0
+DF$episode[is.na(DF$episode)] <-0
+
+#colour terms similar to the 4 key terms differently
+DF["colour"] = "black"
+DF$colour[DF$game > 0 | DF$term == "game"] <- "blue"
+DF$colour[(DF$news > DF$game) | DF$term == "news"] <- "yellow"
+DF$colour[(DF$music > DF$game & DF$music > DF$news ) | DF$term == "music"] <- "green"
+DF$colour[(DF$episode > DF$game & DF$episode > DF$news & DF$episode > DF$music ) | DF$term == "episode"] <- "red"
+
+#plot with different colours - limit to top 170 words (because it looks nice to have 170)
+DF2 <- DF[DF$count>140,]
+wordcloud(words = DF2$term, freq = DF2$count, ordered.colors = T, colors =DF2$colour, random.order = FALSE)
+
+#plot key
+text(1, 1, label = paste("like Game   "),cex=0.7)
+points(0.91,1, cex = 1.6, pch = 15, col = "blue")
+text(1, 0.97, label = paste("like News   "),cex=0.7)
+points(0.91,0.97, cex = 1.6, pch = 15, col = "yellow")
+text(0.993, 0.94, label = paste("like Music "),cex=0.7)
+points(0.91,0.94, cex = 1.6, pch = 15, col = "green")
+text(1, 0.91, label = paste("like Episode"),cex=0.7)
+points(0.91,0.91, cex = 1.6, pch = 15, col = "red")
+```
+**Figure 11:** Wordcloud of major words categorised by word similarity.
+
+As well as word likeness, the emotion behind the titles is also reviewed. This is on the basis that exciting or shocking titles may draw views. This is analysed using an NRC sentiment dictionary.
+```{r warning=FALSE}
+#plot sentiment of titles
+sentimentDFposneg <- DFfull %>%
+  inner_join(get_sentiments("nrc"), by= c("term"="word")) 
+
+labelDF <- data.frame(sentiment = sentimentDFposneg %>%
+                        group_by(sentiment) %>% summarise(),
+                      label = c("Negative","Positive","Negative","Negative","Positive","Negative","Positive",
+                                "Negative","Positive","Positive"))
+
+sentimentDFposneg %>%
+  group_by(sentiment) %>%
+  summarise(count = n_distinct(document)) %>%
+  left_join(.,labelDF,by = "sentiment") %>%
+  ggplot(.,aes(x=sentiment, y=count,fill=label)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_bw() +
+  facet_wrap(~label, nrow=2,scales = "free_y")
+
+#add details to main table (need to convert to for loop)
+sentDoc <- sentimentDFposneg %>%
+  group_by(sentiment,document) %>%
+  summarise(count = sum(count))
+sentDoc$document <- as.numeric(sentDoc$document)
+
+for (i in 1: length(unique(sentDoc$sentiment))){
+  newdata <- left_join(newdata,sentDoc[sentDoc$sentiment==unique(sentDoc$sentiment)[i],2:3], 
+                       by = c("Numb" = "document"), suffix = c("",paste(".titsento",unique(sentDoc$sentiment)[i])))
+}
+newdata[,35:length(newdata)][is.na(newdata[,35:length(newdata)])] <-0
+```
+**Figure 12:** Frequency of terms with relevent emotions, categorized between positive and negative emotions.
+
+This shows interesting trends; notably relatively high levels of anticipation. This data will be fed into our Machine learning algorithms.
+
+###Descriptions - does anybody actually read them?
+While descriptions are generally hidden in YouTube views. Description sentiment was extracted to see if it is a good predictor of video success. Figure 13 shows the top positive and negative words in the descriptions.The sentiment analysis, using the afinn dictionary, gives these a score of between -3 and 3 relative to how positive of negative they are. This is then summed for each video.
+```{r warning=FALSE}
+###simple find length of description
+deslength <- data.frame(video_id=newdata$video_id,lendescription=apply(newdata,2,nchar)[,"description"])
+newdata <- left_join(newdata,deslength, by  = "video_id")
+
+#create corpus of descriptions
+descCorpus <- Corpus(VectorSource(newdata$description))
+
+#process descriptions
+descCorpus <- tm_map(descCorpus, content_transformer(tolower))
+descCorpus<- tm_map(descCorpus,toSpace,"[^[:graph:]]")
+descCorpus <- tm_map(descCorpus, content_transformer(removeURL))
+descCorpus <- tm_map(descCorpus, content_transformer(removeNumPunct))
+descCorpus <- tm_map(descCorpus, removeWords, c(stopwords("english"),stopwords("french"),stopwords("german")))
+descCorpus <- tm_map(descCorpus, stripWhitespace)
+
+#convert to tdm
+desctdm <- TermDocumentMatrix(descCorpus,control = list(wordLengths = c(3, Inf)))
+
+#take high frequency words (taken as too large if we don't subset)
+freq_high = 1000
+freq.terms <- findFreqTerms(desctdm, lowfreq = freq_high)
+cutdesctdm <- desctdm[desctdm$dimnames$Terms %in% freq.terms,]
+
+# calculate the word frenquency 
+term.freq <- rowSums(as.matrix(cutdesctdm)) 
+
+# only keep the frequencies of words(terms) appeared more then freq_thre times
+term.freq <- subset(term.freq, term.freq >= freq_high) 
+
+# select the words(terms) appeared more then freq_thre times, according to selected term.freq
+freqtitlewords <- data.frame(term = names(term.freq), freq = term.freq)
+freqtitlewords <- freqtitlewords[order(freqtitlewords$freq),]
+freqtitlewords$term <- factor(freqtitlewords$term, levels = freqtitlewords$term[order(freqtitlewords$freq)])
+
+#plot top words
+freqtitlewords %>%
+  arrange(desc(freq)) %>%
+  head(10) %>%
+  ggplot(., aes(x=term, y=freq)) + geom_bar(stat="identity") +
+  xlab("Terms") + ylab("Count") + coord_flip() +
+  theme(axis.text=element_text(size=7)) 
+
+#plot positive Vs negative
+descDFfull <-tidy(desctdm)
+descDFfull %>%
+  inner_join(get_sentiments("bing"), by= c("term"="word")) %>%
+  count(term, sentiment, sort = TRUE) %>%
+  acast(term ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray20", "gray80"),
+                   max.words = 400)
+
+##attaches afinn sentiment score to newdata
+descDFfull$document <- as.numeric(descDFfull$document)
+newdata <- descDFfull %>%
+  inner_join(get_sentiments("afinn"), by= c("term"="word")) %>%
+  group_by(document) %>%
+  summarise(desc_sentiment_score = sum(score)) %>%
+  left_join(newdata,., by = c("Numb" = "document"))
+
+#tidy unnecessary columns
+newdata <- newdata[, !(names(newdata) %in% c("upper","lower","channel_id","Numb"))]
+
+#remove NA values in text mining columns, set as 0 - no sentiment score
+newdata[,33:42][is.na(newdata[,33:42])] <- 0
+```
+**Figure 13:** Positive and negative words in descriptions
+
+#Prescriptive analysis: Clustering
+
+To build on insights gained from whole-dataset visualisations and text mining, an unsupervised, clustering algorithm has been used. A K-means clustering, machine learning approach has divided data into clusters, providing information on patterns of relationships.
+
+6 variables are used to cluster each video in the video summarized dataset: max likes, max views, max dislikes, max comments, number of days trending and how quickly a video trends after being posted. Variables are first scaled using min-max normalisation to make variance within variables comparable between variables. 
+```{r warning=FALSE}
+# Select variables and min-max normalisation 
+index<-newdata[,c(2,5:9)]  
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))}
+videos_min_max <- as.data.frame(lapply(index[1:6], normalize))
+```
+Then, k-means clustering is applied to the data. Using a common approach of setting k as root(n/2) would be too large to see any reasonable pattern. As such the elbow method was used, plotting average variance within clusters against k value for 10 k values between 1 and 30. This shows (figure 14) diminishing returns of k values from 4-6 onwards. For interpretability the smaller value of k=4 is used to review the clusters.
+```{r warning=FALSE}
+#k-means clustering elbow method
+varsum <- vector()
+#run k means with 10 iterations, using k means values of c(3,6,9 ... 30).
+for (j in 1:10){
+  k=2*j
+  videos_clusters_calcK <- kmeans(videos_min_max, k,iter.max = 20,nstart = k)
+  varsum[j] <- 0
+  #sum variation within clusters
+  for (i in 1:k){
+    #returns mean variation within clusters for all clusters
+    varsum[j] <- mean(videos_clusters_calcK$withinss)
+  }
+}
+
+#plot variation as line
+data.frame(value = varsum, k_value =2*1:10) %>%
+  ggplot(., aes(x = k_value, y = value)) + geom_line()+
+  geom_segment(aes(x = 4, y = 28, xend = 4, yend = 0), linetype=2)+
+  geom_segment(aes(x = 4, y = 28, xend = 0, yend = 28), linetype=2)+
+  geom_point(data=data.frame(lat = c(28), long = c(4)),aes(long,lat),colour="blue",size=4)
+```
+**Figure 14:** Elbow method visualisation
+
+The clusters are created with k = 4. The size of each cluster is reasonable to understand the pattern
+```{r warning=FALSE}
+#cluster create
+videos_clusters <- kmeans(videos_min_max, 4,iter.max = 20,nstart = 5)
+# cluster sizes
+videos_clusters$size
+```
+The centers of clusters, by variable are shown  below. An interesting pattern is that, when examining count (times a video trends) and mintrend_after(time until it first trends), theres a clear split of videos that trend many times and very quickly (cluster 1) and videos that trend many times and take longer to first trend (cluster 4). The importance of these variables will be carried forward to our predictive model.
+```{r warning=FALSE}
+# cluster centers
+round(videos_clusters$centers,5)
+```
+The individual points are plotted in figure 15 which reaffirms the previously mentioned trend. 
+```{r warning=FALSE}
+##visualisation of clusters
+#Create table of values with corresponding unique ID
+clustersum <- tibble(newdata$video_id, newdata$count, newdata$mxlikes,newdata$mxviews,newdata$mxcomments, newdata$mintrend_after , videos_clusters$cluster)
+clustersum$`videos_clusters$cluster`<- as.character(clustersum$`videos_clusters$cluster`)
+#Melt into database form
+clustersum <-melt(clustersum)
+
+#Plot. y axis is log scaled for improved visibility
+ggplot(clustersum, aes(variable, value)) +
+    geom_boxplot()+
+  facet_wrap(~clustersum$`videos_clusters$cluster`,nrow=4)+ scale_y_log10() +
+  scale_x_discrete(labels= c("First trend time", "Max comments", "Max views", "Max likes", "Times trending"))+
+  theme_bw()+ coord_flip()
+```
+**Figure 15:** Value of each variable across 4 created clusters.
+
+After adding the clusters into the dataset, further insights can be discovered by counting the number of videos of different countries and categories in each cluster. Music videos have large counts in cluster 1 and cluster 3, showing that music videos tend to trend for long time and have large number of clicks. Entertainment videos appear more in cluster 2,3,4, indicating that entertainment videos tend to trend for shorter time and have fewer numbers of clicks compared with music videos. Videos of People & Blogs, Howto & Style, Sports are mostly short-trended.
+```{r warning=FALSE}
+# add cluster into data
+newdata$cluster <- videos_clusters$cluster
+newdata <- newdata %>%
+  mutate(cluster = videos_clusters$cluster)
+
+# no. of videos in each cluster by category
+ggplot(newdata,aes(x=category,fill=category))+
+  geom_bar()+ 
+  coord_flip()+
+  facet_wrap(~cluster,scale="free")+
+  theme_bw()
+
+```
+**Figure 16:** Number of videos in each cluster by category.
+
+Interestingly, videos which first trend in GB tend to trend for long time and have many interactions, while videos trend in France, Canada and Germany usually trend for very short period of time and gain fewer number of interactions; given 1 is high interactions and 4 is low.
+```{r warning=FALSE}
+# no. of videos in each cluster by country
+ggplot(newdata)+ 
+  geom_bar(aes(x=Country,fill=Country))+
+  coord_flip()+
+  facet_wrap(~cluster,scales = "free")+
+  theme_bw()
+```
+**Figure 17:** Number of videos in each cluster by country
+
+#Predictive analysis: Regression Tree - How long will a video trend for
+With insights gained from  exploratory analysis, text mining and clustering, a model is constructed to predict how long a video will trend for. Regression trees were chosen as they are interpretable for our client and give an appropriate, continuous output for our predicted variable. 
+
+First, we select variables to be used. Previous analysis has shown the country a video first trends in has a significant impact on trending days. While this would create a strong model, the "first" trending country is  uncertain from the data as it may trend in multiple countries on the same day. As such this will be ignored to build a tree with more controlable "input variables" like title details and category that we can present to a potential client. 
+
+The predictor variables are extracted from the video summarized data. Categorical variables are then changed into factors and replace NA values with 0. After that, we separate the training data (90%) and the test data (10%).
+
+Predictor variables used are:
+
+ * Video category
+ * Whether a video is posted on a weekday or a weekend
+ * How many subscribers the channel has
+ * The "score" of the tags used (the sum of the global frequency of the used tags), the number of tags and the number of major (top 500) tags
+ * The length of the title and the proportion of the title that is capitalised
+ * The count of words in the title that are classified as representing characteristicsincluding fear, joy, negativity, positivity and anticipation.
+ * The sentiment score of the description (whether it is happy or sad)
+```{r warning=FALSE}
+# Data processing
+videos_model<-newdata[,c(2,22:24,26,28:44)]
+videos_model$category<-factor(videos_model$category)
+videos_model$publish_date_weekend<-factor(videos_model$publish_date_weekend)
+videos_model$tagscore[is.na(videos_model$tagscore)]<-0
+videos_model$tagnum[is.na(videos_model$tagnum)]<-0
+videos_model$desc_sentiment_score[is.na(videos_model$desc_sentiment_score)]<-0
+videos_model$majortags[is.na(videos_model$majortags)]<-0
+# separate training and test data
+p_index=0.9*nrow(videos_model)
+videos_train <- videos_model[1:p_index, ]
+videos_test <- videos_model[(p_index+1):nrow(videos_model), ]
+```
+After training the data, we can see the importance of different variables and create a tree. According to the summary below, the number of subscribers of each channel and the categories of the videos are the most important variables to predict the number of trending days. Tagscore, number of major tags in the tags and the sentiment score of the description also have impact on the predicted value.
+```{r warning=FALSE}
+# train model
+m.rpart <- rpart(count ~., data = videos_train) 
+summary(m.rpart)
+```
+The tree is shown in figure 18. Videos in the training data are first split according to the number of subscribers of the channel, and then category is used to split the tree further. 
+```{r warning=FALSE}
+#visualisation
+rpart.plot(m.rpart, digits = 4, branch=1,type=1,extra=1,shadow.col="gray",border.col="black",split.cex=1.2,main="Regression Tree")
+```
+**Figure 18:** Regression Tree for trending days prediction.
+
+The quality of the model evaluated by calculating the Mean Absolute Error of our prediction and comparing that to the mean trending days (count variable) as the benchmark. We can see that our prediction is better with the MAE of 0.826. 
+```{r warning=FALSE}
+# generate prediction
+p.rpart <- predict(m.rpart, videos_test[,-1])
+# compare predicted and test values
+MAE <- function(actual, predicted) {
+  mean(abs(actual - predicted))  
+}
+baseline <- mean(videos_train$count) # mean value of training data as benchmark
+table(p.rpart, videos_test$count)
+MAE(p.rpart, videos_test$count) # MAE of prediction= 0.826
+MAE(baseline, videos_test$count) # MAE of mean(training)= 1.088
+```
+We used random forest methods to improve the model, however improvement was minimal and running the ensemble learning method added considerable processing time. Model trees and neural network learning were also considered. However, the results of regression tree was deemed preferable, since it trains fast, it has fewer limits on the data type of variables, it is very easy to understand with clear statement and plots, and the importance of each variable is clearly shown. This makes it interpretable to a YouTube using business client and deployable in their work environment
+
+#Conclusions
+A 14% improvement on the mean can be considered a good model. Comparing this to publically available models of similar kinds, Netflix awarded a $1m prize to developers who improved their rating predictions by roughly 20% of the mean benchmark. Our model serves a similar purpose and performs well in comparison. Ensemble learning would improve the output, however, processing and time constraints prevented this being efficiently deployed. Going forward other data could be built into the tree to improve the recommendation, e.g. length of video, and number of shares.
+
+A concluding remark is this it is interesting how categorisation plays such a key role. Whether it is the make-up of YouTube pushing categories to users, or that certain types of videos have more impact remains to be seen.
