@@ -4,6 +4,7 @@ output: html_notebook
 ---
 
 #Contribution list
+
 The project was collaborative, with each of our team of 3 helping eachother. However, we were given the following subsections
 to be in charge of. Key tasks performed outside of those subsections are included as bullet points.
 
@@ -22,6 +23,7 @@ Junwei Xing (JX499) - Machine learning and associated visualisations
  * Produced k-means, regression tree and compared these outputs with other methods like neural networks.
 
 #Introduction
+
 Data, detailing the top 200 trending YouTube videos each day for 5 major countries, is available from 
 [Kaggle](https://www.kaggle.com/datasnaek/youtube-new/). Here we use this data to create a regression tree that predicts how many days
 a YouTube video will trend for. We predict this based on YouTube channel data; text mining of the descriptions, titles and tags the 
@@ -42,6 +44,7 @@ This report, therefore progresses through sections of *Data Preparation*, *Explo
 *Predictive Analysis* and *Conclusion*.
 
 #Data preparation
+
 We begin by loading the data and appropriate R libraries.
 ```{r warning=FALSE}
 #data manipulation
@@ -348,11 +351,13 @@ top6_categories%>%
 **Figure 8:** When do videos trend - a decreasing trend in time. This appears to happen irrelevant of video type.
 
 ##Text mining
+
 With likes, dislikes, comments and number of days trending being classed as outcome variables, to support a predictive model, text mining 
 of the tags, titles and video descriptions has been performed to evaluate if any of these impact video success. Numerical values for the
 text characteristics are calculated and included in the video summarized dataset, for use in predictive models, as follows.
 
 ###Tags - quality or quantity?
+
 Each video is given a tags score as the sum of the popularity of each of the tags used; popularity being the frequency of their use
 globally (within the whole population). Each video also gets a "major tag" score, being how many times they use a tag in the top 500
 tags, figure 9 shows the top 20 tags. Finally the number of tags is also added to the dataset.
@@ -438,6 +443,7 @@ topTagsDF %>%
 **Figure 9:** Top tags with count of use.
 
 ###Titles - setting the mood for the video
+
 Reviewing the data saw significant and varied use of capital letters. To review whether all capitals GRABBED ATTENTION, or if no capitals
 limited success due to being untidy, the ratio of capitals:lower case letters is calculated, as well as the length of the title.
 ```{r warning=FALSE}
@@ -606,6 +612,7 @@ newdata[,35:length(newdata)][is.na(newdata[,35:length(newdata)])] <-0
 This shows interesting trends; notably relatively high levels of anticipation. This data will be fed into our Machine learning algorithms.
 
 ###Descriptions - does anybody actually read them?
+
 While descriptions are generally hidden in YouTube views. Description sentiment was extracted to see if it is a good predictor of video
 success. Figure 13 shows the top positive and negative words in the descriptions.The sentiment analysis, using the afinn dictionary, gives 
 these a score of between -3 and 3 relative to how positive of negative they are. This is then summed for each video.
@@ -785,6 +792,7 @@ ggplot(newdata)+
 **Figure 17:** Number of videos in each cluster by country
 
 #Predictive analysis: Regression Tree - How long will a video trend for
+
 With insights gained from  exploratory analysis, text mining and clustering, a model is constructed to predict how long a video will 
 trend for. Regression trees were chosen as they are interpretable for our client and give an appropriate, continuous output for our 
 predicted variable. 
